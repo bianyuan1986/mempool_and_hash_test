@@ -18,6 +18,7 @@
 #include <rte_lcore.h>
 #include <rte_mempool.h>
 #include <rte_cycles.h>
+#include <rte_jhash.h>
 
 #include "mempool.h"
 #include "hashTable.h"
@@ -33,7 +34,7 @@ typedef int (*pFunc)(void*);
 
 struct lcore_conf 
 {
-	struct HashTable *htbl;
+	struct hashTable *htbl;
 
 	unsigned int poolSize;
 	unsigned int elementSize;
@@ -63,6 +64,30 @@ struct userData
 uint64_t g_cycles_per_second = 0;
 struct lcore_conf g_lcore_conf[RTE_MAX_LCORE];
 
+static void assign_key(void *src, void *dst)
+{
+	struct key *s = (struct key*)src;
+	struct key *d = (struct key*)dst;
+
+	if( s && d )
+	{
+		d->hashKey = s->hashKey;
+		d->verifyKey = s->verifyKey;		
+	}
+}
+
+static void assign_value(void *src, void *dst)
+{
+	struct value *s = (struct value*)src;
+	struct value *d = (struct value*)dst;
+
+	if( s && d )
+	{
+		d->status = s->status;
+		d->count = s->count;
+	}
+}
+
 static int compare(void *key1, void *key2)
 {
 	struct key *src = NULL;
@@ -84,7 +109,7 @@ static int compare(void *key1, void *key2)
 	return 0;
 }
 
-static int hash(void *data, void *key)
+static int hash(void *data, int dLen, void *key)
 {
 	struct key *k = NULL;
 
@@ -94,8 +119,8 @@ static int hash(void *data, void *key)
 	}
 	k = (struct key *)key;
 
-	k->hashKey = BKDRHash((char*)data);
-	k->verifyKey = ELFHash((char*)data);
+	k->hashKey = rte_jhash(data, dLen, 0);
+	k->verifyKey = BKDRHash((char*)data);
 
 	return k->hashKey;
 }
@@ -117,6 +142,17 @@ static void rte_free_wrap(void *addr)
 	}
 }
 
+struct HashTableOps gHtblOps =
+{
+	.cmp = compare,
+	.hash = hash,
+	.mallocFunc = rte_malloc_wrap,
+	.freeFunc = rte_free_wrap,
+	.assignKey = assign_key,
+	.assignValue = assign_value,
+	.assessFunc = NULL,
+};
+
 static int primary_process(__attribute__((unused))void *args)
 {
 	while( 1 )
@@ -127,7 +163,7 @@ static int primary_process(__attribute__((unused))void *args)
 	return 0;
 }
 
-static void generate_random_data(char *data, int len)
+static int generate_random_data(char *data, int len)
 {
 #undef BUF_LEN
 #define BUF_LEN 128 
@@ -137,13 +173,13 @@ static void generate_random_data(char *data, int len)
 
 	if( data )
 	{
-		return;
+		return 0;
 	}
 	f = popen("cat /dev/urandom|base64|head -n 1", "r");
 	if( f == NULL )
 	{
 		printf("popen failed\n");
-		return;
+		return 0;
 	}
 	fgets(host, BUF_LEN, f);
 	copy = strlen((const char*)host);
@@ -153,6 +189,8 @@ static void generate_random_data(char *data, int len)
 	{
 		printf("pclose failed:%s\n", strerror(errno));
 	}
+
+	return copy;
 }
 
 static int secondary_process(__attribute__((unused))void *args)
@@ -160,7 +198,7 @@ static int secondary_process(__attribute__((unused))void *args)
 #undef BUF_LEN
 #define BUF_LEN 8*1024
 #define UA_SAMPLE "Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/33.0.1750.27 Safari/537.36 TST(Tencent_Security_Team) 80dc"
-	struct HashTable *htbl = NULL;
+	struct hashTable *htbl = NULL;
 	struct Mempool *mp = NULL;
 	struct userData *obj = NULL;
 
@@ -212,12 +250,12 @@ static int secondary_process(__attribute__((unused))void *args)
 		}
 		memcpy(ipHostUa+uaLen, buf, strlen(buf));
 		copy += strlen(buf);
-		generate_random_data(ipHostUa+copy, BUF_LEN-copy);
-		if( hash_table_find(htbl, ipHostUa, (void*)&(obj->k)) )
+		copy += generate_random_data(ipHostUa+copy, BUF_LEN-copy);
+		if( hash_table_find(htbl, ipHostUa, copy, (void*)&(obj->k), (void*)&(obj->v)) )
 		{
 			continue;
 		}
-		ret = hash_table_insert(htbl, (void*)ipHostUa, (void*)&(obj->k), (void*)&(obj->v), 10*60*g_cycles_per_second);
+		ret = hash_table_insert(htbl, (void*)ipHostUa, copy, (void*)&(obj->k), (void*)&(obj->v), 10*60*g_cycles_per_second);
 		switch(ret)
 		{
 			case RET_NEW:
@@ -372,13 +410,13 @@ int main(int argc, char *argv[])
 
 		case RTE_PROC_SECONDARY:
 		{
-			static struct HashTable *htbl = NULL;
+			static struct hashTable *htbl = NULL;
 			struct lcore_conf *lconf = NULL;
 			int i = 0;
 			int idx = 0;
 			int ret = 0;
 
-			htbl = hash_table_create( HASH_TABLE_SIZE, sizeof(struct key), sizeof(struct value), compare, hash, rte_malloc_wrap, rte_free_wrap);
+			htbl = hash_table_create( HASH_TABLE_SIZE, &gHtblOps); 
 			memset(g_lcore_conf, 0x00, sizeof(g_lcore_conf));
 			for( ; i < RTE_MAX_LCORE; i++)
 			{
